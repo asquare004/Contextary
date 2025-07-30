@@ -2,18 +2,35 @@ let popup = null;
 let button = null;
 let popupOpen = false;
 let lastSelectionText = "";
+let currentMode = "free"; // default to free, changeable by user
+
+// Persist and load user choice (persist across restarts)
+function setContextMode(mode) {
+    currentMode = mode;
+    if (chrome?.storage?.sync) {
+        chrome.storage.sync.set({ context_mode: mode });
+    }
+}
+function getContextMode() {
+    return new Promise((resolve) => {
+        if (currentMode) return resolve(currentMode);
+        if (!chrome || !chrome.storage) return resolve("free");
+        chrome.storage.sync.get(["context_mode"], (result) => {
+            resolve(result.context_mode || "free");
+        });
+    });
+}
 
 function getSelectionContext() {
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0) return null;
     const text = selection.toString().trim();
-    if (!/^[a-zA-Z\-']{2,}$/.test(text)) return null; // Only single words
+    if (!/^[a-zA-Z\-']{2,}$/.test(text)) return null;
 
     const range = selection.getRangeAt(0);
     const container = range.startContainer;
     let node = container.nodeType === 3 ? container.parentNode : container;
 
-    // Get the full sentence
     let paragraph = node.innerText || node.textContent || "";
     if (!paragraph) paragraph = document.body.innerText || "";
     let sentences = paragraph.match(/[^.!?]*[.!?]/g) || [paragraph];
@@ -34,27 +51,22 @@ function removePopupAndButton() {
 function addOutsideClickListener() {
     document.addEventListener('mousedown', handleOutsideClick);
 }
-
 function removeOutsideClickListener() {
     document.removeEventListener('mousedown', handleOutsideClick);
 }
-
 function handleOutsideClick(event) {
     if (
         (button && button.contains(event.target)) ||
         (popup && popup.contains(event.target))
     ) {
-        // Clicked inside our UI; do nothing
         return;
     }
     removePopupAndButton();
 }
 
 document.addEventListener("mouseup", (e) => {
-    // If popup is open, don't add anything new
     if (popupOpen) return;
 
-    // Only trigger if the selection changed (prevents firing again on button click)
     const selection = window.getSelection();
     const text = selection.toString().trim();
     if (!text || text === lastSelectionText) return;
@@ -65,7 +77,7 @@ document.addEventListener("mouseup", (e) => {
         const sel = getSelectionContext();
         if (!sel) return;
 
-        lastSelectionText = sel.word; // Mark the last word we showed
+        lastSelectionText = sel.word;
 
         button = document.createElement("button");
         button.innerText = "🔎 Get Meaning";
@@ -78,19 +90,23 @@ document.addEventListener("mouseup", (e) => {
 
         button.onclick = async (ev) => {
             ev.stopPropagation();
-            // Prevent re-triggering of mouse events on the old selection:
             window.getSelection().removeAllRanges();
             if (button) button.remove();
             button = null;
-            popupOpen = true; // Mark popup as open!
-            await showPopup(sel, x, y);
-            addOutsideClickListener();
+            popupOpen = true;
+            getContextMode().then(mode => {
+                currentMode = mode;
+                showPopup(sel, x, y, mode);
+                addOutsideClickListener();
+            });
         };
     }, 50);
 });
 
-async function showPopup(sel, x, y) {
+async function showPopup(sel, x, y, mode) {
     if (popup) popup.remove();
+    mode = mode || currentMode || "free";
+    currentMode = mode;
 
     popup = document.createElement("div");
     popup.className = "dict-ext-popup";
@@ -99,7 +115,7 @@ async function showPopup(sel, x, y) {
     popup.style.left = x + 10 + "px";
     popup.style.top = y + 20 + "px";
 
-    // Fetch meanings/pronunciation from DictionaryAPI
+    // Dictionary data
     let dictData, synonyms = [], contextMeaning = null, audioUrl = null;
     try {
         dictData = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(sel.word)}`)
@@ -111,26 +127,44 @@ async function showPopup(sel, x, y) {
         dictData = null;
     }
 
-    // Fetch synonyms from Datamuse
     try {
         synonyms = await fetch(`https://api.datamuse.com/words?rel_syn=${encodeURIComponent(sel.word)}`)
             .then(r => r.json());
     } catch { synonyms = []; }
 
-    // Fetch OpenAI context-aware meaning if API key present
-    let openaiKey = await getOpenAIKey();
-    if (openaiKey) {
+    // Get OpenAI key if needed
+    let openaiKey = null;
+    if (mode === "openai") openaiKey = await getOpenAIKey();
+
+    // Compute context-aware meaning
+    if (mode === "openai" && openaiKey) {
         try {
             contextMeaning = await getContextMeaningOpenAI(openaiKey, sel.word, sel.context);
+            contextMeaning = sanitizeOpenAIResponse(contextMeaning);
         } catch (e) {
-            contextMeaning = null;
+            contextMeaning = tryHeuristicContext(dictData, sel.context, sel.word);
         }
     } else {
-        contextMeaning = tryHeuristicContext(dictData, sel.context);
+        contextMeaning = tryHeuristicContext(dictData, sel.context, sel.word);
     }
 
-    // Build HTML
-    let html = `<div class="dict-ext-header"><strong>${sel.word}</strong>`;
+    // Radio controls for mode switching (in popup!)
+    let radioHTML = `
+        <div class="dict-ext-modes">
+          <label style="margin-right:1em;">
+            <input type="radio" name="dict-mode" value="free" ${mode === "free" ? "checked" : ""}> 
+            Free (Heuristic)
+          </label>
+          <label>
+            <input type="radio" name="dict-mode" value="openai" ${mode === "openai" ? "checked" : ""}>
+            OpenAI (API key)
+          </label>
+        </div>
+    `;
+
+    // Build the rest of the HTML
+    let html = radioHTML;
+    html += `<div class="dict-ext-header"><strong>${sel.word}</strong>`;
     if (audioUrl)
         html += ` <button class="dict-ext-audio" title="Play pronunciation">🔊</button>`;
     html += `</div>`;
@@ -163,7 +197,7 @@ async function showPopup(sel, x, y) {
 
     popup.innerHTML = html;
 
-    // Play pronunciation
+    // Pronunciation
     if (audioUrl) {
         popup.querySelector(".dict-ext-audio").onclick = (ev) => {
             ev.stopPropagation();
@@ -172,11 +206,21 @@ async function showPopup(sel, x, y) {
         };
     }
 
-    // Close handler
+    // Close
     popup.querySelector(".dict-ext-close").onclick = (ev) => {
         ev.stopPropagation();
         removePopupAndButton();
     };
+
+    // Radio controls (switch model live!)
+    popup.querySelectorAll('input[name="dict-mode"]').forEach(radio => {
+        radio.onclick = async (ev) => {
+            let selected = radio.value;
+            setContextMode(selected);
+            // Rebuild the popup with the new mode
+            showPopup(sel, x, y, selected);
+        };
+    });
 }
 
 // Get OpenAI API key from extension storage (if set)
@@ -189,11 +233,40 @@ function getOpenAIKey() {
     });
 }
 
-// Call OpenAI API for contextual meaning
+function sanitizeOpenAIResponse(str) {
+    if (!str) return "";
+    let ix = str.toLowerCase().indexOf('other possible meanings');
+    if (ix !== -1) return str.slice(0, ix).trim();
+    return str.trim();
+}
+
+// Heuristic context matching using compromise.js
+function tryHeuristicContext(dictData, context, word) {
+    if (!dictData || !Array.isArray(dictData) || !context || !word) return null;
+    if (window.nlp) {
+        try {
+            let doc = window.nlp(context);
+            let tags = doc.match(word).terms(0).out('tags');
+            let pos = tags && tags.length > 0 ? Object.keys(tags[0])[1] : "";
+            let matches = [];
+            for (const meaning of dictData[0].meanings || []) {
+                if (!pos || meaning.partOfSpeech.toLowerCase().includes(pos.toLowerCase())) {
+                    for (const def of meaning.definitions) {
+                        matches.push(def.definition);
+                    }
+                }
+            }
+            if (matches.length > 0) return matches[0];
+        } catch (e) {}
+    }
+    // Fallback: first meaning
+    return dictData[0]?.meanings?.[0]?.definitions?.[0]?.definition || null;
+}
+
+// OpenAI API
 async function getContextMeaningOpenAI(apiKey, word, context) {
     const url = "https://api.openai.com/v1/chat/completions";
     const prompt = `Given the word "${word}" in the sentence: "${context}", provide the most likely meaning of the word in this context. Then, list all other possible meanings if relevant.`;
-
     const res = await fetch(url, {
         method: "POST",
         headers: {
@@ -201,7 +274,7 @@ async function getContextMeaningOpenAI(apiKey, word, context) {
             "Content-Type": "application/json"
         },
         body: JSON.stringify({
-            model: "gpt-4o-mini",
+            model: "gpt-4o",
             messages: [
                 { role: "system", content: "You are a world-class English lexicographer." },
                 { role: "user", content: prompt }
@@ -214,11 +287,4 @@ async function getContextMeaningOpenAI(apiKey, word, context) {
     if (data.choices && data.choices[0] && data.choices[0].message)
         return data.choices[0].message.content;
     return null;
-}
-
-// Best-guess meaning using local heuristics (fallback)
-function tryHeuristicContext(dictData, context) {
-    if (!dictData || !Array.isArray(dictData) || !context) return null;
-    const firstMeaning = dictData[0]?.meanings?.[0]?.definitions?.[0]?.definition || null;
-    return firstMeaning;
 }
