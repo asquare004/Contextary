@@ -1,6 +1,6 @@
 # 📖 Contextary Extension
 
-A beautiful, privacy-first browser extension for instantly looking up accurate and context-aware meanings, synonyms, and pronunciation of any English word—on any website.  
+A beautiful, privacy-first browser extension for instantly looking up accurate and context-aware meanings, synonyms, and pronunciation of any English word on any website.  
 Supports both OpenAI-powered context meaning (for advanced users) and a free local alternative (no API key required).
 
 ## ✨ Features
